@@ -3,6 +3,7 @@ const readline = require('readline');
 const { pathfinder, Movements, goals: { GoalNear, GoalBlock, GoalFollow } } = require('mineflayer-pathfinder');
 const vec3 = require('vec3');
 const collectBlock = require('mineflayer-collectblock').plugin
+const captchaSolver = require('./captcha.js');
 
 let bots = {};
 let commandInterface = readline.createInterface({
@@ -18,8 +19,9 @@ function startBot(version, username, host, port, count, delay) {
         port: port,
         username: username + i,
         version: version,
+        timeout: 60000,
         keepAlive: true,
-        keepAliveInterval: 10000,
+        keepAliveInterval: 5000,
       });
 
       if (!bot.pathfinder) {
@@ -44,6 +46,12 @@ function startBot(version, username, host, port, count, delay) {
         console.log(`${bot.username} has disconnected.`);
         stopMining(bot.username); 
         delete bots[bot.username]; 
+      });
+
+      const captcha = new captchaSolver(bot);
+      captcha.once('success', async (image) => {
+          const name = bot.username;      
+          await image.toFile(`./maps/captcha_${name}.png`);
       });
       
       bots[username + i] = bot;
@@ -157,8 +165,8 @@ function createCuboid(point1, point2) {
   const z2 = Math.max(point1.z, point2.z);
 
   const positions = [];
-  for (let x = x1; x <= x2; x++) {
-    for (let y = y1; y <= y2; y++) {
+  for (let y = y1; y <= y2; y++) {
+    for (let x = x1; x <= x2; x++) {
       for (let z = z1; z <= z2; z++) {
         positions.push(vec3(x, y, z));
       }
@@ -169,12 +177,12 @@ function createCuboid(point1, point2) {
 
 function getBestTool(bot, block) {
   const tools = {
-    'stone': ['stone_pickaxe', 'iron_pickaxe', 'golden_pickaxe', 'diamond_pickaxe', 'netherite_pickaxe'],
-    'sand': ['stone_shovel', 'iron_shovel', 'golden_shovel', 'diamond_shovel', 'netherite_shovel'],
-    'dirt': ['stone_shovel', 'iron_shovel', 'golden_shovel', 'diamond_shovel', 'netherite_shovel'],
-    'gravel': ['stone_shovel', 'iron_shovel', 'golden_shovel', 'diamond_shovel', 'netherite_shovel'],
-    'log': ['stone_axe', 'iron_axe', 'golden_axe', 'diamond_axe', 'netherite_axe'],
-    'planks': ['stone_axe', 'iron_axe', 'golden_axe', 'diamond_axe', 'netherite_axe']
+    'stone': ['netherite_pickaxe', 'diamond_pickaxe', 'iron_pickaxe', 'stone_pickaxe', 'golden_pickaxe'],
+    'sand': ['netherite_shovel', 'diamond_shovel', 'iron_shovel', 'stone_shovel', 'golden_shovel'],
+    'dirt': ['netherite_shovel', 'diamond_shovel', 'iron_shovel', 'stone_shovel', 'golden_shovel'],
+    'gravel': ['netherite_shovel', 'diamond_shovel', 'iron_shovel', 'stone_shovel', 'golden_shovel'],
+    'log': ['netherite_axe', 'diamond_axe', 'iron_axe', 'stone_axe', 'golden_axe'],
+    'planks': ['netherite_axe', 'diamond_axe', 'iron_axe', 'stone_axe', 'golden_axe']
   };
 
   const blockType = block.type.name;
@@ -197,6 +205,10 @@ function getBestTool(bot, block) {
 async function mineCuboid(bot, point1, point2) {
   let cube = createCuboid(vec3(point1), vec3(point2));
   let positions = cube.getPositions();
+  bot.mining = true;
+
+  // Sort positions by distance to bot
+  positions.sort((a, b) => bot.entity.position.distanceTo(a) - bot.entity.position.distanceTo(b));
 
   for (let a = 0; a < positions.length; a++) {
     let pos = positions[a];
@@ -209,6 +221,12 @@ async function mineCuboid(bot, point1, point2) {
 
     if (block.name === 'air') {
       console.log(`Block at ${pos} is air`);
+      continue;
+    }
+
+    // Check if the block is accessible
+    if (!isAccessible(bot, block)) {
+      console.log(`Block at ${pos} is not accessible`);
       continue;
     }
 
@@ -241,11 +259,40 @@ async function mineCuboid(bot, point1, point2) {
         }
       } else {
         console.log(`Still cannot reach block at ${pos}`);
+        // Skip this block and move to the next one
+        a--;
       }
     }
+
+    if (!bot.mining) {
+      console.log(`${bot.username} mining stopped.`);
+      bot.pathfinder.setGoal(null);
+      return;
+    }
   }
+
   bot.mining = false;
   bot.pathfinder.setGoal(null);
+  console.log(`${bot.username} finished mining.`);
+}
+
+function isAccessible(bot, block) {
+  const pos = block.position;
+  const directions = [
+    vec3(1, 0, 0), vec3(-1, 0, 0), // x-axis
+    vec3(0, 1, 0), vec3(0, -1, 0), // y-axis
+    vec3(0, 0, 1), vec3(0, 0, -1)  // z-axis
+  ];
+
+  for (const dir of directions) {
+    const neighborPos = pos.plus(dir);
+    const neighborBlock = bot.blockAt(neighborPos);
+    if (neighborBlock && neighborBlock.name === 'air') {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function stopMining(username) {
@@ -295,14 +342,16 @@ function stopCircleAroundPlayer(username) {
   const targetBots = username === '*' ? Object.values(bots) : [bots[username]].filter(bot => bot);
   targetBots.forEach(bot => {
     if (bot.circlePlayer) {
+      bot.pathfinder.setGoal(null);
       bot.circlePlayer.stop();
       console.log(`${bot.username} has stopped circling.`);
     }
   });
 }
 
-function collectBlock1(username, block1) {
+const collectBlock1 = (username, block1) => {
   const targetBots = username === '*' ? Object.values(bots) : [bots[username]].filter(bot => bot);
+
   targetBots.forEach((bot) => {
     if (bot.collecting) return;
 
@@ -316,38 +365,98 @@ function collectBlock1(username, block1) {
     }
 
     const collectBlock = async () => {
-      while (bot.collecting) {
-        const block = bot.findBlock({
-          matching: blockType.id,
-          maxDistance: 64
-        });
-        if (!block) {
-          console.log(`No ${block1} found within 64 blocks`);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          continue;
-        }
+      try {
+        while (bot.collecting) {
+          const block = bot.findBlock({
+            matching: blockType.id,
+            maxDistance: 64,
+            sort: true // Это позволит находить ближайший блок
+          });
+          if (!block) {
+            console.log(`No ${block1} found within 64 blocks`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            continue;
+          }
 
-        if (bot.entity.position.distanceTo(block.position) > 4.5) {
-          console.log(`${bot.username} moving to block at ${block.position}`);
-          await bot.pathfinder.setGoal(new GoalBlock(block.position.x, block.position.y, block.position.z), true);
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
+          if (bot.entity.position.distanceTo(block.position) > 4.5) {
+            console.log(`${bot.username} moving to block at ${block.position}`);
+            await bot.pathfinder.setGoal(new GoalBlock(block.position.x, block.position.y, block.position.z), true);
+            await new Promise(resolve => setTimeout(resolve, 1500));
+            continue; // Продолжаем поиск блока после перемещения
+          }
 
-        try {
-          console.log(`${bot.username} digging block at ${block.position}`);
-          await bot.dig(block);
-          await new Promise(resolve => setTimeout(resolve, 500));
-        } catch (error) {
-          if (error.message !== 'Digging aborted') {
-            console.error(`Failed to collect ${block1}: ${error.message}`);
+          // Проверка и удаление препятствий перед блоком
+          const clearObstacles = async (targetBlock) => {
+            const botPosition = bot.entity.position;
+            const targetPosition = targetBlock.position;
+            const direction = targetPosition.offset(botPosition).normalize();
+            const maxDistance = 5; // Максимальное расстояние для проверки препятствий
+
+            for (let i = 1; i <= maxDistance; i++) {
+              const checkPosition = botPosition.offset(direction.x * i, direction.y * i, direction.z * i);
+              const obstacleBlock = bot.blockAt(checkPosition);
+              if (obstacleBlock && obstacleBlock.type !== 0 && obstacleBlock.type !== blockType.id) {
+                if (!isBlockTransparent(obstacleBlock)) {
+                  console.log(`${bot.username} removing obstacle at ${checkPosition}`);
+                  await bot.dig(obstacleBlock);
+                  await new Promise(resolve => setTimeout(resolve, 1500));
+                }
+              }
+            }
+          };
+
+          await clearObstacles(block);
+
+          let attempts = 0;
+          const maxAttempts = 5; // Лимит на количество попыток добычи блока
+          while (attempts < maxAttempts) {
+            attempts++;
+            try {
+              console.log(`${bot.username} digging block at ${block.position} (attempt ${attempts})`);
+              await bot.dig(block);
+
+              // Проверяем, исчез ли блок
+              const blockAfterDig = bot.blockAt(block.position);
+              if (!blockAfterDig || blockAfterDig.type !== blockType.id) {
+                console.log(`${bot.username} successfully collected ${block1} at ${block.position}`);
+                break;
+              } else {
+                console.log(`${bot.username} failed to collect ${block1} at ${block.position}, retrying...`);
+                await new Promise(resolve => setTimeout(resolve, 1500));
+              }
+            } catch (error) {
+              if (error.message !== 'Digging aborted') {
+                console.error(`Failed to collect ${block1}: ${error.message}`);
+                await new Promise(resolve => setTimeout(resolve, 1500));
+              }
+            }
+          }
+
+          if (attempts >= maxAttempts) {
+            console.log(`${bot.username} failed to collect ${block1} after ${maxAttempts} attempts, moving on...`);
+            // Прерываем попытки и ищем следующий блок
+            continue;
+          } else {
+            // Если блок успешно добыт, ждем некоторое время перед поиском следующего блока
+            await new Promise(resolve => setTimeout(resolve, 1000));
           }
         }
+      } catch (error) {
+        console.error(`An error occurred: ${error.message}`);
+      } finally {
+        bot.collecting = false;
       }
     };
 
     collectBlock();
   });
+};
+
+function isBlockTransparent(block) {
+  const transparentBlocks = [0, 6, 8, 9, 10, 11, 17, 18, 31, 32, 37, 38, 39, 40, 50, 51, 55, 59, 63, 64, 65, 66, 67, 68, 70, 71, 72, 75, 76, 77, 78, 81, 83, 85, 89, 90, 99, 101, 102, 104, 105, 106, 107, 108, 111, 113, 115, 116, 117, 118, 119, 120, 122, 123, 125, 126, 127, 128, 129, 130, 131, 135, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255];
+  return transparentBlocks.includes(block.type);
 }
+
 
 function stopCollecting(username) {
   const targetBots = username === '*' ? Object.values(bots) : [bots[username]].filter(bot => bot);
@@ -356,6 +465,17 @@ function stopCollecting(username) {
       bot.collecting = false;
       bot.pathfinder.setGoal(null);
       console.log(`${bot.username} collecting stopped.`);
+    }
+  });
+}
+
+function sendMessage(botName, message) {
+  const targetBots = botName === '*' ? Object.values(bots) : [bots[botName]].filter(bot => bot);
+  targetBots.forEach(bot => {
+    if (bot && bot.chat && bot._client && bot._client.chat) {
+      bot.chat(message);
+    } else {
+      console.error(`Бот ${botName} не подключен или не готов для отправки сообщений.`);
     }
   });
 }
@@ -408,6 +528,12 @@ commandInterface.on('line', async (input) => {
       const usernamer = parts[1];
       kickBot(usernamer);
       break;
+    case 'send':
+      if(parts.length > 1) {
+      const nick = parts[1]
+      const message = parts[2]
+      sendMessage(nick, message);
+      }
     case 'follow':
       if (parts[1] === 'stop') {
         const user2 = parts[2];
